@@ -40,14 +40,14 @@ public sealed class AgentExecutor
 
         // Assistant summarizes results
         var assistantPrompt =
-        $"""
-        You are an assistant. Summarize tool results into a helpful answer.
+            $"""
+            You are an assistant. Summarize tool results into a helpful answer.
 
-        Plan Rationale: {plan.NaturalLanguageRationale}
+            Plan Rationale: {plan.NaturalLanguageRationale}
 
-        Tool Results:
-        {string.Join("\n---\n", outputs)}
-        """;
+            Tool Results:
+            {string.Join("\n---\n", outputs)}
+            """;
 
         var convo = new List<ChatMessage>(history)
         {

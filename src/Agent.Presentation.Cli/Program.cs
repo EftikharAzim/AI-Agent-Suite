@@ -16,6 +16,11 @@ using Serilog;
 using Serilog.Extensions.Logging;
 using Spectre.Console;
 using System.Net.Http.Headers;
+using Agent.Core.Memory;
+using Agent.Infrastructure.Memory;
+using Qdrant.Client;
+using System.Net.Http.Headers;
+
 
 internal class Program
 {
@@ -59,6 +64,42 @@ internal class Program
         builder.Services.AddSingleton<IConversationStore, InMemoryConversationStore>();
         //builder.Services.AddSingleton<IPlanner, NaivePlanner>();
         builder.Services.AddSingleton<IPlanner, SkPlanner>();
+
+        // Embedding generator:
+        // Preferred: llama.cpp /v1/embeddings (OpenAI-compatible). Fallback: SimpleHash.
+        builder.Services.AddHttpClient("Embeddings", (sp, http) =>
+        {
+            var cfg = sp.GetRequiredService<IConfiguration>();
+            var baseUrl = cfg["Embeddings:BaseUrl"] ?? "http://127.0.0.1:8080/v1";
+            var apiKey = cfg["Embeddings:ApiKey"];
+            var timeout = int.TryParse(cfg["LLM:RequestTimeoutSeconds"], out var t) ? t : 120;
+
+            http.BaseAddress = new Uri(baseUrl);
+            http.Timeout = TimeSpan.FromSeconds(timeout);
+            if (!string.IsNullOrWhiteSpace(apiKey))
+                http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        });
+
+        // Choose embedding implementation at runtime via config
+        builder.Services.AddSingleton<IEmbeddingGenerator>(sp =>
+        {
+            var cfg = sp.GetRequiredService<IConfiguration>();
+            var enabled = bool.TryParse(cfg["Embeddings:Enabled"], out var e) ? e : true;
+            var dim = int.TryParse(cfg["Embeddings:Dim"], out var d) ? d : 384;
+
+            if (enabled)
+            {
+                var model = cfg["Embeddings:Model"] ?? "bge-small";
+                var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient("Embeddings");
+                return new LlamaOpenAIEmbeddingGenerator(http, model, dim);
+            }
+
+            return new SimpleHashEmbeddingGenerator(dim);
+        });
+
+        builder.Services.AddSingleton<IMemoryStore, QdrantMemoryStore>();
+
+        builder.Services.AddSingleton(sp => new QdrantClient("http://localhost:6333"));
 
         builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
 
