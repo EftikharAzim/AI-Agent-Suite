@@ -3,6 +3,7 @@ using Agent.Core.Planning;
 using Agent.Core.Tools;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
+using Serilog;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -30,22 +31,13 @@ public sealed class SkPlanner : IPlanner
         // 2) Build SK ChatHistory from our history
         var chat = new ChatHistory();
         chat.AddSystemMessage(@"
-            You are a planning assistant. Given a conversation and a list of available tools,
-            produce a minimal, ordered plan (JSON) to solve the user's latest request.
-
-            Rules:
-            - Use only tools from the provided list.
-            - If no tool is needed, return an empty array for steps.
-            - Be precise and concise.
-            - Output valid JSON ONLY. No commentary outside JSON.
-
-            JSON schema:
-            {
-              ""rationale"": ""string"",
-              ""steps"": [
-                { ""tool"": ""ToolName"", ""input"": ""string"" }
-              ]
-            }
+        You are a planning assistant. Produce a SINGLE JSON object ONLY, no commentary.
+        Output strictly one object that matches this schema:
+        {
+          ""rationale"": ""string"",
+          ""steps"": [ { ""tool"": ""ToolName"", ""input"": ""string"" } ]
+        }
+        Do not write any explanations or extra text before or after the JSON.
         ");
 
         // Fix: Map Agent.Core.LLM.AuthorRole to Microsoft.SemanticKernel.ChatCompletion.AuthorRole
@@ -73,14 +65,23 @@ public sealed class SkPlanner : IPlanner
         var response = await _chat.GetChatMessageContentAsync(chat, kernel: _kernel, cancellationToken: ct);
         var text = response.Content?.Trim() ?? "{}";
 
-        // 5) Parse robustly
-        var json = ExtractJson(text); // in case model returns stray text
-        var planDto = JsonSerializer.Deserialize<PlanDto>(json, new JsonSerializerOptions
+        PlanDto planDto;
+
+        try
         {
-            PropertyNameCaseInsensitive = true,
-            ReadCommentHandling = JsonCommentHandling.Skip,
-            AllowTrailingCommas = true
-        }) ?? new PlanDto { Rationale = "Empty plan", Steps = [] };
+            var json = ExtractJson(text);
+            Log.Information($"Extracted json = {json}");
+            planDto = JsonSerializer.Deserialize<PlanDto>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+                AllowTrailingCommas = true,
+            }) ?? new PlanDto { Rationale = "Empty plan", Steps = [] };
+        }
+        catch (JsonException ex)
+        {
+            Console.WriteLine($"[Planner] JSON parse error: {ex.Message}\nRaw:\n{text}\n");
+            planDto = new PlanDto { Rationale = "Invalid JSON", Steps = [] };
+        }
 
         // 6) Map
         var steps = (planDto.Steps ?? []).Select(s => new PlanStep(s.Tool ?? "", s.Input ?? "")).ToList();
@@ -88,13 +89,36 @@ public sealed class SkPlanner : IPlanner
         return new Plan(steps, rationale);
     }
 
-    private static string ExtractJson(string s)
+    private static string ExtractJson(string text)
     {
-        // Be forgiving: find first '{' and last '}'.
-        var start = s.IndexOf('{');
-        var end = s.LastIndexOf('}');
-        if (start >= 0 && end > start) return s[start..(end + 1)];
-        return "{}";
+        // Collect all complete JSON objects in the string
+        var jsonBlocks = new List<string>();
+        var depth = 0;
+        var start = -1;
+
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '{')
+            {
+                if (depth == 0) start = i;
+                depth++;
+            }
+            else if (text[i] == '}')
+            {
+                depth--;
+                if (depth == 0 && start >= 0)
+                {
+                    jsonBlocks.Add(text[start..(i + 1)]);
+                    start = -1;
+                }
+            }
+        }
+
+        if (jsonBlocks.Count == 0)
+            return "{\"rationale\":\"No valid JSON found.\",\"steps\":[]}";
+
+        // If multiple JSONs exist, take the LAST one — it's usually the "final" plan
+        return jsonBlocks.Last();
     }
 
     private sealed class PlanDto

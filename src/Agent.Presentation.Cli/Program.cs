@@ -19,7 +19,6 @@ using System.Net.Http.Headers;
 using Agent.Core.Memory;
 using Agent.Infrastructure.Memory;
 using Qdrant.Client;
-using System.Net.Http.Headers;
 
 
 internal class Program
