@@ -1,4 +1,4 @@
-﻿using Agent.Application.Agent;
+using Agent.Application.Agent;
 using Agent.Core.Conversations;
 using Agent.Core.LLM;
 using Agent.Core.Planning;
@@ -18,8 +18,9 @@ using Spectre.Console;
 using System.Net.Http.Headers;
 using Agent.Core.Memory;
 using Agent.Infrastructure.Memory;
+using Azure.Identity;
+using Azure.Security.KeyVault.Secrets;
 using Qdrant.Client;
-
 
 internal class Program
 {
@@ -27,14 +28,19 @@ internal class Program
     {
         var builder = Host.CreateApplicationBuilder(args);
 
-        // Configuration
-        builder.Configuration.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-                             .AddEnvironmentVariables();
+        // Configuration - layered approach for security
+        builder.Configuration
+            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+            .AddJsonFile($"appsettings.{builder.Environment.EnvironmentName}.json", optional: true)
+            .AddUserSecrets<Program>(optional: true)  // Local dev secrets
+            .AddEnvironmentVariables();
+
+        // Setup Key Vault (optional, for production)
+        SetupKeyVault(builder);
 
         // Resolve and normalize log path
         var configuredPath = builder.Configuration["Logging:Path"]
                              ?? "%LOCALAPPDATA%/AiAgentSuite/logs/agent-.log";
-
 
         var logPath = Environment.ExpandEnvironmentVariables(configuredPath)
                                  .Replace('/', Path.DirectorySeparatorChar);
@@ -56,16 +62,13 @@ internal class Program
         builder.Logging.ClearProviders();
         builder.Logging.AddProvider(new SerilogLoggerProvider(Log.Logger, dispose: false));
 
-        // Let’s log where we’re writing
         Log.Information("Logging to: {LogPath}", logPath);
 
-        // DI – core services
+        // DI � core services
         builder.Services.AddSingleton<IConversationStore, InMemoryConversationStore>();
-        //builder.Services.AddSingleton<IPlanner, NaivePlanner>();
         builder.Services.AddSingleton<IPlanner, SkPlanner>();
 
-        // Embedding generator:
-        // Preferred: llama.cpp /v1/embeddings (OpenAI-compatible). Fallback: SimpleHash.
+        // Embedding generator
         builder.Services.AddHttpClient("Embeddings", (sp, http) =>
         {
             var cfg = sp.GetRequiredService<IConfiguration>();
@@ -79,7 +82,6 @@ internal class Program
                 http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         });
 
-        // Choose embedding implementation at runtime via config
         builder.Services.AddSingleton<IEmbeddingGenerator>(sp =>
         {
             var cfg = sp.GetRequiredService<IConfiguration>();
@@ -97,13 +99,7 @@ internal class Program
         });
 
         builder.Services.AddSingleton<IMemoryStore, QdrantMemoryStore>();
-
         builder.Services.AddSingleton(sp => new QdrantClient("http://localhost:6333"));
-
-        builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
-
-        //// Temporary model (M2 will replace with OpenAI-compatible LLM)
-        //builder.Services.AddSingleton<IChatModel, EchoChatModel>();
 
         // LLM (OpenAI-compatible)
         builder.Services.AddHttpClient("LLM", (sp, http) =>
@@ -119,7 +115,6 @@ internal class Program
                 http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         });
 
-        // Factory registration for IChatModel
         builder.Services.AddSingleton<IChatModel>(sp =>
         {
             var cfg = sp.GetRequiredService<IConfiguration>();
@@ -138,7 +133,32 @@ internal class Program
         builder.Services.AddSingleton(sp => SkKernelFactory.Create(sp));
         builder.Services.AddSingleton<AgentExecutor>();
 
+        // Tool registration
+        builder.Services.AddHttpClient<SerpSearchTool>();
+
+        builder.Services.AddSingleton<ITool>(sp =>
+        {
+            var cfg = sp.GetRequiredService<IConfiguration>();
+            var factory = sp.GetRequiredService<IHttpClientFactory>();
+            var http = factory.CreateClient("SerpApi");
+            var apiKey = cfg["SerpApi:ApiKey"];
+            
+            if (string.IsNullOrWhiteSpace(apiKey))
+            {
+                Log.Warning("SerpApi key not configured. Search tool will not be fully functional. Set it via User Secrets: dotnet user-secrets set \"SerpApi:ApiKey\" \"your-key\"");
+            }
+            
+            return new SerpSearchTool(http, apiKey ?? "");
+        });
+
+        builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
+
         var host = builder.Build();
+
+        var registry = host.Services.GetRequiredService<IToolRegistry>();
+        var toolCount = registry.All.Count();
+        Log.Information("ToolRegistry loaded {Count} tools: {Names}",
+            toolCount, string.Join(", ", registry.All.Select(t => t.Name)));
 
         // Simple REPL
         var sessionId = builder.Configuration["Agent:DefaultSessionId"] ?? "demo";
@@ -156,6 +176,49 @@ internal class Program
 
             AnsiConsole.MarkupLineInterpolated($"\n[cyan]Assistant>[/] {Markup.Escape(reply)}");
             AnsiConsole.MarkupLineInterpolated($"[grey]latency: {sw.ElapsedMilliseconds} ms[/]\n");
+        }
+    }
+
+    private static void SetupKeyVault(HostApplicationBuilder builder)
+    {
+        var keyVaultEnabled = bool.TryParse(builder.Configuration["KeyVault:Enabled"], out var enabled) && enabled;
+        var keyVaultUrl = builder.Configuration["KeyVault:VaultUrl"];
+
+        if (keyVaultEnabled && !string.IsNullOrWhiteSpace(keyVaultUrl))
+        {
+            try
+            {
+                var credential = new DefaultAzureCredential();
+                var client = new SecretClient(new Uri(keyVaultUrl), credential);
+                
+                // Manually fetch secrets and add them to configuration
+                var secretsDict = new Dictionary<string, string?>();
+                
+                // Fetch the secrets we need
+                var secretNames = new[] { "SerpApi--ApiKey", "LLM--ApiKey", "Embeddings--ApiKey" };
+                foreach (var secretName in secretNames)
+                {
+                    try
+                    {
+                        var secret = client.GetSecret(secretName);
+                        secretsDict[secretName] = secret.Value.Value;
+                    }
+                    catch
+                    {
+                        // Secret doesn't exist, skip it
+                    }
+                }
+                
+                if (secretsDict.Count > 0)
+                {
+                    builder.Configuration.AddInMemoryCollection(secretsDict);
+                    Log.Information("Loaded {Count} secrets from Azure Key Vault", secretsDict.Count);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Failed to configure Azure Key Vault. Falling back to configuration files.");
+            }
         }
     }
 }
